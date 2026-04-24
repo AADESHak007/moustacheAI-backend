@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # ---- Signed URL Expiry ----
     signed_url_expiry_seconds: int = 3600  # 1 hour
 
+    # ---- Gemini AI ----
+    gemini_api_key: str = ""
+
 
 @lru_cache()
 def get_settings() -> Settings:

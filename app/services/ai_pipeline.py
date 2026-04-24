@@ -1,232 +1,149 @@
 """
-AI Processing Pipeline — AI Mustache Generator
-
-Pipeline steps (strictly per system design):
-  1. Load input image from bytes
-  2. Run MediaPipe FaceMesh → 468 landmark coordinates
-  3. Extract lip anchor points (indices 13, 61, 291) → anchor_x, anchor_y, lip_width, angle
-  4. Load mustache PNG asset (transparent background, 600×200px base)
-  5. Transform mustache: resize (scale = lip_width / 600) + rotate to match lip angle
-  6. Alpha composite mustache onto input image using Pillow
-  7. Compress to JPEG quality=85 and return bytes
-
-References (system design §03):
-  - Lip anchor indices: 0, 13, 14, 17
-  - Compute: anchor_x (midpoint), anchor_y (above lip), lip_width, angle
-  - Mustache base size: 600×200px
-  - Output: JPEG quality=85
+AI Processing Pipeline — Gemini Image Generation
+================================================
+Workflow:
+  1. Map style_id → descriptive AI prompt
+  2. Encode user image as base64 for Gemini
+  3. Call Gemini with the image + prompt to generate a new image
+  4. Return the generated image as JPEG bytes
 """
 
 import io
-import math
+import base64
 import logging
-from typing import Tuple
 
-import cv2
-import mediapipe as mp
-import numpy as np
 from PIL import Image
+import google.generativeai as genai
+
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# MediaPipe FaceMesh setup
+# Style ID → AI Prompt Mapping
 # ---------------------------------------------------------------------------
-_mp_face_mesh = mp.solutions.face_mesh
+STYLE_PROMPTS: dict[str, str] = {
+    "chevron":   "Add a thick, full chevron mustache above this person's upper lip. The mustache should look photorealistic, match the person's natural hair color, and blend naturally with the skin.",
+    "handlebar": "Add a classic handlebar mustache to this person's face. The ends should curl upward stylishly. Make it photorealistic, matching their hair color.",
+    "fu_manchu": "Add a Fu Manchu mustache to this person's face — thin strips growing from the upper lip that hang down past the jawline. Make it photorealistic.",
+    "pencil":    "Add a very thin, precisely groomed pencil-thin mustache just above this person's upper lip. Make it photorealistic and neat.",
+    "walrus":    "Add a thick, bushy walrus mustache to this person's face that droops down over the mouth. Make it photorealistic and match their hair color.",
+    "english":   "Add a narrow English-style mustache to this person's face with long, straight whiskers extending horizontally outward. Make it photorealistic.",
+}
 
-# ---------------------------------------------------------------------------
-# Landmark indices (MediaPipe FaceMesh 468-point model)
-# Per system design: "Indices 0, 13, 14, 17"
-# ---------------------------------------------------------------------------
-# Mouth corners — used to compute lip_width and rotation angle
-_LIP_LEFT_IDX  = 61    # Left mouth corner
-_LIP_RIGHT_IDX = 291   # Right mouth corner
-
-# Upper lip references for vertical anchor placement
-_UPPER_LIP_IDX = 13    # Upper lip center (per system design)
-_NOSE_TIP_IDX  = 4     # Nose tip — used to verify face orientation
-
-# Mustache asset base width (all assets are 600×200px)
-_MUSTACHE_BASE_WIDTH = 600
+DEFAULT_PROMPT = "Add a natural-looking mustache to this person's upper lip. Make it photorealistic and match their hair color."
 
 
 # ---------------------------------------------------------------------------
 # Custom exception
 # ---------------------------------------------------------------------------
 class AIProcessingError(Exception):
-    """Raised when the AI pipeline cannot process the image (e.g., no face detected)."""
+    """Raised when the AI pipeline cannot process the image."""
     pass
 
 
 # ---------------------------------------------------------------------------
-# Step 2 + 3: Face detection and lip anchor extraction
+# Core function
 # ---------------------------------------------------------------------------
-def _extract_lip_anchors(image_rgb: np.ndarray) -> dict:
+def generate_mustache(image_bytes: bytes, style_id: str) -> bytes:
     """
-    Run MediaPipe FaceMesh and compute mustache placement anchors.
+    Sends the user's photo and a style prompt to Gemini to generate
+    a mustached version of the photo.
 
     Args:
-        image_rgb: H×W×3 numpy array in RGB colour space.
+        image_bytes: Raw bytes of the user's selfie (JPEG or PNG).
+        style_id:    One of the defined style IDs (e.g. 'handlebar').
 
     Returns:
-        dict with keys:
-            anchor_x  (int)   – horizontal center of the mustache
-            anchor_y  (int)   – vertical position (above upper lip)
-            lip_width (float) – pixel distance between mouth corners
-            angle     (float) – rotation angle in degrees (matches lip tilt)
+        JPEG bytes of the AI-generated output image.
 
     Raises:
-        AIProcessingError: if no face is detected.
+        AIProcessingError: On API failure or no image returned.
     """
-    h, w = image_rgb.shape[:2]
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise AIProcessingError("GEMINI_API_KEY is not configured on the server.")
 
-    with _mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as face_mesh:
-        results = face_mesh.process(image_rgb)
+    # Step 1 — Configure Gemini
+    genai.configure(api_key=settings.gemini_api_key)
 
-    if not results.multi_face_landmarks:
-        raise AIProcessingError(
-            "No face detected. Please use a clear, well-lit, front-facing photo."
+    # Step 2 — Select prompt
+    prompt = STYLE_PROMPTS.get(style_id, DEFAULT_PROMPT)
+    full_prompt = (
+        f"{prompt} "
+        "Keep the person's face, background, lighting, and all other features "
+        "exactly the same. Only add the mustache. Output a photorealistic image."
+    )
+    logger.info(f"[Gemini] style={style_id!r} | prompt={full_prompt[:80]}...")
+
+    # Step 3 — Prepare image for Gemini (inline data)
+    img_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    # Resize to max 1024px on the longest side (Gemini works best with this)
+    max_dim = 1024
+    if max(img_pil.width, img_pil.height) > max_dim:
+        ratio = max_dim / max(img_pil.width, img_pil.height)
+        img_pil = img_pil.resize(
+            (int(img_pil.width * ratio), int(img_pil.height * ratio)),
+            Image.LANCZOS,
         )
 
-    landmarks = results.multi_face_landmarks[0].landmark
+    img_buffer = io.BytesIO()
+    img_pil.save(img_buffer, format="JPEG", quality=90)
+    img_buffer.seek(0)
+    input_b64 = base64.b64encode(img_buffer.read()).decode("utf-8")
 
-    def px(idx: int) -> Tuple[int, int]:
-        """Convert normalised landmark to pixel coordinates."""
-        lm = landmarks[idx]
-        return int(lm.x * w), int(lm.y * h)
+    # Step 4 — Call Gemini (imagen-3.0-generate-002 supports image output)
+    try:
+        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        response = model.generate_content(
+            [
+                {"mime_type": "image/jpeg", "data": input_b64},
+                full_prompt,
+            ],
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.4,
+                candidate_count=1,
+            ),
+        )
+    except Exception as e:
+        logger.error(f"[Gemini] API call failed: {e}")
+        raise AIProcessingError(f"Gemini API error: {e}")
 
-    # Pixel positions of key landmarks
-    left_corner  = px(_LIP_LEFT_IDX)
-    right_corner = px(_LIP_RIGHT_IDX)
-    upper_lip    = px(_UPPER_LIP_IDX)
+    # Step 5 — Extract generated image from response
+    # Gemini returns inline image data in parts when image generation is requested
+    result_bytes: bytes | None = None
 
-    # Lip width: Euclidean distance between mouth corners
-    lip_width = math.dist(left_corner, right_corner)
+    for part in response.candidates[0].content.parts:
+        if hasattr(part, "inline_data") and part.inline_data:
+            result_bytes = base64.b64decode(part.inline_data.data)
+            break
 
-    # Anchor X: horizontal midpoint of mouth corners
-    anchor_x = (left_corner[0] + right_corner[0]) // 2
+    if result_bytes is None:
+        # Gemini returned text instead of an image — log it and raise
+        text_response = response.text if hasattr(response, "text") else "No text"
+        logger.warning(f"[Gemini] No image in response. Text: {text_response[:200]}")
+        raise AIProcessingError(
+            "Gemini did not return an image. "
+            "The model may not support image generation with this prompt."
+        )
 
-    # Anchor Y: place mustache above upper lip
-    # Lift by ~35% of lip width so the mustache sits naturally
-    lift = int(lip_width * 0.35)
-    anchor_y = upper_lip[1] - lift
+    # Step 6 — Normalise to JPEG bytes
+    out_img = Image.open(io.BytesIO(result_bytes)).convert("RGB")
+    out_buf = io.BytesIO()
+    out_img.save(out_buf, format="JPEG", quality=85, optimize=True)
+    out_buf.seek(0)
 
-    # Angle: slope of the line connecting mouth corners
-    dx = right_corner[0] - left_corner[0]
-    dy = right_corner[1] - left_corner[1]
-    angle = math.degrees(math.atan2(dy, dx))
-
-    logger.info(
-        f"Anchors — center=({anchor_x},{anchor_y}), "
-        f"lip_width={lip_width:.1f}px, angle={angle:.2f}°"
-    )
-
-    return {
-        "anchor_x":  anchor_x,
-        "anchor_y":  anchor_y,
-        "lip_width": lip_width,
-        "angle":     angle,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Step 5: Mustache transformation (resize + rotate)
-# ---------------------------------------------------------------------------
-def _transform_mustache(
-    mustache: Image.Image,
-    anchors: dict,
-) -> Tuple[Image.Image, Tuple[int, int]]:
-    """
-    Resize and rotate the mustache asset to match the detected face geometry.
-
-    Args:
-        mustache: PIL Image of the mustache PNG (RGBA, 600×200px base).
-        anchors:  Dict from _extract_lip_anchors().
-
-    Returns:
-        (transformed_mustache, paste_position)
-        paste_position is the top-left (x, y) for Image.paste().
-    """
-    lip_width = anchors["lip_width"]
-    angle     = anchors["angle"]
-    anchor_x  = anchors["anchor_x"]
-    anchor_y  = anchors["anchor_y"]
-
-    # Scale: system design → scale = lip_width / 600
-    scale = lip_width / _MUSTACHE_BASE_WIDTH
-    new_w = max(int(mustache.width  * scale), 10)
-    new_h = max(int(mustache.height * scale), 10)
-
-    # Resize
-    scaled = mustache.resize((new_w, new_h), Image.LANCZOS)
-
-    # Rotate to match lip angle (expand keeps full image visible)
-    rotated = scaled.rotate(-angle, expand=True, resample=Image.BICUBIC)
-
-    # Center paste position: anchor point should be at mustache center
-    paste_x = anchor_x - rotated.width  // 2
-    paste_y = anchor_y - rotated.height // 2
-
-    return rotated, (paste_x, paste_y)
+    logger.info(f"[Gemini] ✅ Image generated successfully for style={style_id!r}")
+    return out_buf.read()
 
 
 # ---------------------------------------------------------------------------
-# Step 6 + 7: Alpha composite and JPEG export
+# Public entry point (used by jobs router)
 # ---------------------------------------------------------------------------
-def overlay_mustache(
-    input_image_bytes: bytes,
-    mustache_bytes: bytes,
-) -> bytes:
+def overlay_mustache(image_bytes: bytes, style_id: str = "handlebar") -> bytes:
     """
-    Full AI pipeline entry point.
-
-    Args:
-        input_image_bytes: Raw bytes of the user's selfie (JPEG or PNG).
-        mustache_bytes:    Raw bytes of the mustache PNG asset (transparent background).
-
-    Returns:
-        JPEG bytes of the composited output image (quality=85).
-
-    Raises:
-        AIProcessingError: If no face is detected or pipeline fails.
-        Exception:         On unexpected errors (caller should catch broadly).
+    Public entry point called by the jobs background task.
+    Delegates to generate_mustache().
     """
-    # --- Step 1: Load input image ---
-    input_pil = Image.open(io.BytesIO(input_image_bytes)).convert("RGBA")
-    input_np  = np.array(input_pil.convert("RGB"))   # MediaPipe needs RGB numpy
-
-    # --- Step 2 + 3: Detect face → extract anchors ---
-    anchors = _extract_lip_anchors(input_np)
-
-    # --- Step 4: Load mustache asset ---
-    mustache_pil = Image.open(io.BytesIO(mustache_bytes)).convert("RGBA")
-
-    # --- Step 5: Transform mustache ---
-    transformed, paste_pos = _transform_mustache(mustache_pil, anchors)
-
-    # --- Step 6: Alpha composite ---
-    # Create a transparent overlay the same size as the input
-    overlay = Image.new("RGBA", input_pil.size, (0, 0, 0, 0))
-
-    # Clamp paste position to image bounds to avoid out-of-range errors
-    px = max(paste_pos[0], -transformed.width)
-    py = max(paste_pos[1], -transformed.height)
-    overlay.paste(transformed, (px, py), mask=transformed)
-
-    # Merge input + mustache overlay
-    composited = Image.alpha_composite(input_pil, overlay)
-
-    # --- Step 7: Compress to JPEG quality=85 ---
-    final_rgb = composited.convert("RGB")
-    output_buffer = io.BytesIO()
-    final_rgb.save(output_buffer, format="JPEG", quality=85, optimize=True)
-    output_buffer.seek(0)
-
-    logger.info("✅ Mustache overlay complete")
-    return output_buffer.read()
+    return generate_mustache(image_bytes, style_id)

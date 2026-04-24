@@ -1,17 +1,14 @@
 # =============================================================================
 # Dockerfile — AI Mustache Generator Backend
 # Base: python:3.11-slim
+# No OpenCV/MediaPipe — uses Gemini API for all AI processing
 # =============================================================================
 
 FROM python:3.11-slim
 
-# System dependencies required by OpenCV and MediaPipe
+# Pillow needs libjpeg for JPEG encoding
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgl1 \
+    libjpeg-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -31,5 +28,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
   CMD python -c "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"
 
-# Start server via Railway's $PORT or default 8000
+# Start server
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

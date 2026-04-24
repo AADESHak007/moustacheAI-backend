@@ -6,6 +6,7 @@ Endpoints:
   GET  /api/jobs/{id}  — Poll for job status → pending | processing | done | failed
 """
 
+import base64
 import logging
 import uuid
 
@@ -29,81 +30,64 @@ from app.services.jobs_service import JobsService
 from app.services.storage import StorageService
 from app.utils.validators import validate_image
 
-logger = logging.getLogger(__name__)
+logger   = logging.getLogger(__name__)
 settings = get_settings()
-router  = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
+router   = APIRouter()
+limiter  = Limiter(key_func=get_remote_address)
+
+# ---------------------------------------------------------------------------
+# In-memory results cache  (Job ID → base64 data URI)
+# Single-instance safe — works on Render free tier with 1 worker.
+# ---------------------------------------------------------------------------
+_results_cache: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
-# Background Task: Run AI pipeline and update job record
+# Background Task
 # ---------------------------------------------------------------------------
 async def _process_job(
-    job_id:          str,
-    user_id:         str,
-    style_id:        str,
-    image_bytes:     bytes,
-    jobs_service:    JobsService,
-    storage_service: StorageService,
+    job_id:       str,
+    style_id:     str,
+    image_bytes:  bytes,
+    jobs_service: JobsService,
 ) -> None:
     """
-    Background task executed after POST /api/jobs returns.
-
-    Steps:
-      1. Mark job as 'processing'
-      2. Download mustache asset from /assets/{style_id}.png
-      3. Run AI pipeline (face detection + overlay)
-      4. Upload result to /results/{job_id}.jpg
-      5. Generate signed URL (1hr expiry)
-      6. Mark job as 'done' with output_url
+    Background task:
+      1. Mark job → processing
+      2. Call Gemini with user photo + style prompt
+      3. Convert result to base64 data URI
+      4. Store in memory cache
+      5. Mark job → done  (or failed on error)
     """
     try:
         # Step 1 — Mark as processing
         await jobs_service.update_job_status(job_id, JobStatus.PROCESSING)
 
-        # Step 2 — Download mustache asset
-        asset_path    = f"{style_id}.png"
-        mustache_bytes = await storage_service.download_file(
-            settings.assets_bucket, asset_path
-        )
+        # Step 2 — Run Gemini AI pipeline
+        result_bytes = overlay_mustache(image_bytes, style_id=style_id)
 
-        # Step 3 — Run AI pipeline
-        result_bytes = overlay_mustache(image_bytes, mustache_bytes)
+        # Step 3 — Convert to base64 data URI
+        b64_str    = base64.b64encode(result_bytes).decode("utf-8")
+        output_url = f"data:image/jpeg;base64,{b64_str}"
 
-        # Step 4 — Upload result image
-        result_path = f"{job_id}.jpg"
-        await storage_service.upload_image(
-            bucket=settings.results_bucket,
-            path=result_path,
-            data=result_bytes,
-            content_type="image/jpeg",
-        )
+        # Step 4 — Cache result
+        _results_cache[job_id] = output_url
 
-        # Step 5 — Generate signed URL
-        output_url = storage_service.get_signed_url(
-            settings.results_bucket, result_path
-        )
-
-        # Step 6 — Mark done
+        # Step 5 — Mark done
         await jobs_service.update_job_status(
             job_id, JobStatus.DONE, output_url=output_url
         )
         logger.info(f"✅ Job {job_id} → DONE")
 
     except AIProcessingError as exc:
-        # Known failure: no face detected, etc.
-        logger.warning(f"AI processing failed for job {job_id}: {exc}")
+        logger.warning(f"[AI] Job {job_id} failed: {exc}")
         await jobs_service.update_job_status(
             job_id, JobStatus.FAILED, error=str(exc)
         )
-
     except Exception as exc:
-        # Unexpected failure
-        logger.error(f"Unexpected error for job {job_id}: {exc}", exc_info=True)
+        logger.error(f"[Job] Unexpected error for {job_id}: {exc}", exc_info=True)
         await jobs_service.update_job_status(
-            job_id,
-            JobStatus.FAILED,
-            error="An internal error occurred. Please try again.",
+            job_id, JobStatus.FAILED, error="An internal error occurred. Please try again."
         )
 
 
@@ -124,22 +108,20 @@ async def _process_job(
 async def create_job(
     request:          Request,
     background_tasks: BackgroundTasks,
-    image:    UploadFile = File(...,   description="Selfie photo. JPEG or PNG. Max 5MB. Max 4000×4000px."),
-    style_id: str        = Form(...,   description="Mustache style ID (e.g. 'handlebar')."),
-    user_id:  str        = Form(None,  description="Client-generated UUID. Persisted in the mobile app."),
+    image:    UploadFile = File(...,  description="Selfie photo. JPEG or PNG. Max 5MB."),
+    style_id: str        = Form(...,  description="Mustache style ID (e.g. 'handlebar')."),
+    user_id:  str        = Form(None, description="Client-generated UUID."),
 ):
-    # Generate user_id if not provided
     if not user_id:
         user_id = str(uuid.uuid4())
 
+    # Validate image bytes
+    image_bytes = await validate_image(image)
+
+    jobs_service = JobsService()
+
+    # Validate style_id against DB (falls back gracefully if DB is down)
     try:
-        jobs_service    = JobsService()
-        storage_service = StorageService()
-
-        # --- Validate image ---
-        image_bytes = await validate_image(image)
-
-        # --- Validate style_id ---
         styles          = await jobs_service.get_styles()
         valid_style_ids = {s["id"] for s in styles}
         if style_id not in valid_style_ids:
@@ -147,62 +129,36 @@ async def create_job(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid style_id '{style_id}'. Valid options: {sorted(valid_style_ids)}.",
             )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # DB unavailable — allow any style_id through (pipeline handles unknown ones)
+        logger.warning(f"Styles DB check skipped (DB error): {e}")
 
-        # --- 1-active-job-per-user limit ---
-        active = await jobs_service.get_active_jobs_count(user_id)
-        if active >= 1:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="You already have an active job. Please wait for it to complete.",
-            )
+    job_id = str(uuid.uuid4())
 
-        job_id = str(uuid.uuid4())
-        
-        try:
-            # Prevent database crashes if Supabase isn't hooked up yet
-            await storage_service.upload_image(
-                bucket=settings.uploads_bucket,
-                path=f"{job_id}.jpg",
-                data=image_bytes,
-                content_type=image.content_type or "image/jpeg",
-            )
-            input_url = storage_service.get_signed_url(settings.uploads_bucket, f"{job_id}.jpg")
-            job = await jobs_service.create_job(
-                user_id=user_id,
-                style_id=style_id,
-                input_image_url=input_url,
-            )
-        except Exception as e:
-            logger.error(f"Supabase error intercepted: {e}. Generating mock job!")
-            job = {"id": job_id, "created_at": "now"}
-
-        # --- Kick off background AI processing ---
-        background_tasks.add_task(
-            _process_job,
-            job_id=job["id"],
+    # Persist job record to DB (best-effort — non-fatal)
+    try:
+        job = await jobs_service.create_job(
             user_id=user_id,
             style_id=style_id,
-            image_bytes=image_bytes,
-            jobs_service=jobs_service,
-            storage_service=storage_service,
+            input_image_url="[in-memory]",
         )
-
-        logger.info(f"Job {job['id']} queued (user={user_id}, style={style_id})")
-
-        return JobResponse(
-            job_id=job["id"],
-            status=JobStatus.PENDING,
-            created_at=job.get("created_at"),
-        )
+        job_id = job["id"]
     except Exception as e:
-        logger.error(f"Critical error in create_job: {e}", exc_info=True)
-        # Fallback to a mock job even if validation fails!
-        job_id = str(uuid.uuid4())
-        return JobResponse(
-            job_id=job_id,
-            status=JobStatus.PENDING,
-            created_at=None,
-        )
+        logger.warning(f"DB insert skipped: {e}")
+
+    # Kick off background AI processing
+    background_tasks.add_task(
+        _process_job,
+        job_id=job_id,
+        style_id=style_id,
+        image_bytes=image_bytes,
+        jobs_service=jobs_service,
+    )
+
+    logger.info(f"Job {job_id} queued (user={user_id}, style={style_id})")
+    return JobResponse(job_id=job_id, status=JobStatus.PENDING, created_at=None)
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +171,17 @@ async def create_job(
     description="Poll every 2 seconds. Status: pending → processing → done | failed.",
 )
 async def get_job_status(job_id: str):
+    # Check in-memory cache first (fastest path)
+    cached_url = _results_cache.get(job_id)
+    if cached_url:
+        return JobStatusResponse(
+            job_id=job_id,
+            status=JobStatus.DONE,
+            output_url=cached_url,
+            error=None,
+        )
+
+    # Fall back to DB
     jobs_service = JobsService()
     try:
         job = await jobs_service.get_job(job_id)
@@ -223,19 +190,20 @@ async def get_job_status(job_id: str):
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Job '{job_id}' not found.",
             )
+        return JobStatusResponse(
+            job_id=job["id"],
+            status=JobStatus(job["status"]),
+            output_url=job.get("output_image_url"),
+            error=job.get("error_message"),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Get job status DB error intercepted: {e}. Returning mock DONE status.")
-        # FAKE the AI being completely done, using a placeholder image for the result!
+        # DB unavailable — job is still processing in background
+        logger.warning(f"DB status check failed for {job_id}: {e}")
         return JobStatusResponse(
             job_id=job_id,
-            status=JobStatus.DONE,
-            output_url="https://placehold.co/400x400.png?text=Mustachified!",
+            status=JobStatus.PROCESSING,
+            output_url=None,
             error=None,
         )
-
-    return JobStatusResponse(
-        job_id=job["id"],
-        status=JobStatus(job["status"]),
-        output_url=job.get("output_image_url"),
-        error=job.get("error_message"),
-    )
