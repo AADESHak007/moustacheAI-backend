@@ -6,13 +6,12 @@
 FROM python:3.11-slim
 
 # System dependencies required by OpenCV and MediaPipe
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
-    libgl1-mesa-glx \
-    libgstreamer1.0-0 \
+    libxrender1 \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
