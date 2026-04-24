@@ -95,7 +95,7 @@ def generate_mustache(image_bytes: bytes, style_id: str) -> bytes:
 
     # Step 4 — Call Gemini (imagen-3.0-generate-002 supports image output)
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        model = genai.GenerativeModel("gemini-3.1-flash-image-preview")
         response = model.generate_content(
             [
                 {"mime_type": "image/jpeg", "data": input_b64},
@@ -111,31 +111,39 @@ def generate_mustache(image_bytes: bytes, style_id: str) -> bytes:
         raise AIProcessingError(f"Gemini API error: {e}")
 
     # Step 5 — Extract generated image from response
-    # Gemini returns inline image data in parts when image generation is requested
     result_bytes: bytes | None = None
 
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "inline_data") and part.inline_data:
-            result_bytes = base64.b64decode(part.inline_data.data)
-            break
+    try:
+        # Log the full response parts for debugging
+        for i, part in enumerate(response.candidates[0].content.parts):
+            if hasattr(part, "inline_data") and part.inline_data:
+                logger.info(f"[Gemini] Part {i} contains inline_data (size: {len(part.inline_data.data)})")
+                # In some SDK versions, data is already bytes. In others, it's base64 string.
+                if isinstance(part.inline_data.data, bytes):
+                    result_bytes = part.inline_data.data
+                else:
+                    result_bytes = base64.b64decode(part.inline_data.data)
+                break
+            elif hasattr(part, "text") and part.text:
+                logger.info(f"[Gemini] Part {i} contains text: {part.text[:100]}...")
 
-    if result_bytes is None:
-        # Gemini returned text instead of an image — log it and raise
-        text_response = response.text if hasattr(response, "text") else "No text"
-        logger.warning(f"[Gemini] No image in response. Text: {text_response[:200]}")
-        raise AIProcessingError(
-            "Gemini did not return an image. "
-            "The model may not support image generation with this prompt."
-        )
+        if result_bytes is None:
+            text_resp = response.text if hasattr(response, "text") else "No image or text returned."
+            logger.warning(f"[Gemini] FAILED: Model returned text instead of an image. Response: {text_resp}")
+            raise AIProcessingError(f"Model returned text instead of an image: {text_resp[:100]}")
 
-    # Step 6 — Normalise to JPEG bytes
-    out_img = Image.open(io.BytesIO(result_bytes)).convert("RGB")
-    out_buf = io.BytesIO()
-    out_img.save(out_buf, format="JPEG", quality=85, optimize=True)
-    out_buf.seek(0)
+        # Step 6 — Normalise to JPEG bytes
+        out_img = Image.open(io.BytesIO(result_bytes)).convert("RGB")
+        out_buf = io.BytesIO()
+        out_img.save(out_buf, format="JPEG", quality=85, optimize=True)
+        out_buf.seek(0)
 
-    logger.info(f"[Gemini] ✅ Image generated successfully for style={style_id!r}")
-    return out_buf.read()
+        logger.info(f"[Gemini] ✅ Image generated successfully")
+        return out_buf.read()
+    except Exception as e:
+        if isinstance(e, AIProcessingError): raise
+        logger.error(f"[Gemini] Error processing result: {e}")
+        raise AIProcessingError(f"Error processing Gemini result: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
