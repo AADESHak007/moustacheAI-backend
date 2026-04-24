@@ -26,7 +26,11 @@ class StorageService:
     """Thin wrapper around Supabase Storage operations."""
 
     def __init__(self) -> None:
-        self.client: Client = get_supabase_client()
+        try:
+            self.client: Client | None = get_supabase_client()
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {e}")
+            self.client = None
 
     # ------------------------------------------------------------------
     # Upload
@@ -53,6 +57,9 @@ class StorageService:
         Raises:
             Exception on Supabase SDK error.
         """
+        if not self.client:
+            raise Exception("Supabase client not initialized")
+            
         try:
             self.client.storage.from_(bucket).upload(
                 path=path,

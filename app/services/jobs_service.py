@@ -19,7 +19,11 @@ class JobsService:
     """Data access layer for jobs and styles tables."""
 
     def __init__(self) -> None:
-        self.client: Client = get_supabase_client()
+        try:
+            self.client: Client | None = get_supabase_client()
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {e}")
+            self.client = None
 
     # ------------------------------------------------------------------
     # Jobs — Create
@@ -35,6 +39,9 @@ class JobsService:
 
         Returns the created row as a dict.
         """
+        if not self.client:
+            raise Exception("Supabase client not initialized")
+            
         job_id = str(uuid.uuid4())
         payload = {
             "id":              job_id,

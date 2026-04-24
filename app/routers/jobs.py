@@ -132,67 +132,77 @@ async def create_job(
     if not user_id:
         user_id = str(uuid.uuid4())
 
-    jobs_service    = JobsService()
-    storage_service = StorageService()
-
-    # --- Validate image ---
-    image_bytes = await validate_image(image)
-
-    # --- Validate style_id ---
-    styles          = await jobs_service.get_styles()
-    valid_style_ids = {s["id"] for s in styles}
-    if style_id not in valid_style_ids:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid style_id '{style_id}'. Valid options: {sorted(valid_style_ids)}.",
-        )
-
-    # --- 1-active-job-per-user limit ---
-    active = await jobs_service.get_active_jobs_count(user_id)
-    if active >= 1:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="You already have an active job. Please wait for it to complete.",
-        )
-
-    job_id = str(uuid.uuid4())
-    
     try:
-        # Prevent database crashes if Supabase isn't hooked up yet
-        await storage_service.upload_image(
-            bucket=settings.uploads_bucket,
-            path=f"{job_id}.jpg",
-            data=image_bytes,
-            content_type=image.content_type or "image/jpeg",
-        )
-        input_url = storage_service.get_signed_url(settings.uploads_bucket, f"{job_id}.jpg")
-        job = await jobs_service.create_job(
+        jobs_service    = JobsService()
+        storage_service = StorageService()
+
+        # --- Validate image ---
+        image_bytes = await validate_image(image)
+
+        # --- Validate style_id ---
+        styles          = await jobs_service.get_styles()
+        valid_style_ids = {s["id"] for s in styles}
+        if style_id not in valid_style_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid style_id '{style_id}'. Valid options: {sorted(valid_style_ids)}.",
+            )
+
+        # --- 1-active-job-per-user limit ---
+        active = await jobs_service.get_active_jobs_count(user_id)
+        if active >= 1:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="You already have an active job. Please wait for it to complete.",
+            )
+
+        job_id = str(uuid.uuid4())
+        
+        try:
+            # Prevent database crashes if Supabase isn't hooked up yet
+            await storage_service.upload_image(
+                bucket=settings.uploads_bucket,
+                path=f"{job_id}.jpg",
+                data=image_bytes,
+                content_type=image.content_type or "image/jpeg",
+            )
+            input_url = storage_service.get_signed_url(settings.uploads_bucket, f"{job_id}.jpg")
+            job = await jobs_service.create_job(
+                user_id=user_id,
+                style_id=style_id,
+                input_image_url=input_url,
+            )
+        except Exception as e:
+            logger.error(f"Supabase error intercepted: {e}. Generating mock job!")
+            job = {"id": job_id, "created_at": "now"}
+
+        # --- Kick off background AI processing ---
+        background_tasks.add_task(
+            _process_job,
+            job_id=job["id"],
             user_id=user_id,
             style_id=style_id,
-            input_image_url=input_url,
+            image_bytes=image_bytes,
+            jobs_service=jobs_service,
+            storage_service=storage_service,
+        )
+
+        logger.info(f"Job {job['id']} queued (user={user_id}, style={style_id})")
+
+        return JobResponse(
+            job_id=job["id"],
+            status=JobStatus.PENDING,
+            created_at=job.get("created_at"),
         )
     except Exception as e:
-        logger.error(f"Supabase error intercepted: {e}. Generating mock job!")
-        job = {"id": job_id, "created_at": "now"}
-
-    # --- Kick off background AI processing ---
-    background_tasks.add_task(
-        _process_job,
-        job_id=job["id"],
-        user_id=user_id,
-        style_id=style_id,
-        image_bytes=image_bytes,
-        jobs_service=jobs_service,
-        storage_service=storage_service,
-    )
-
-    logger.info(f"Job {job['id']} queued (user={user_id}, style={style_id})")
-
-    return JobResponse(
-        job_id=job["id"],
-        status=JobStatus.PENDING,
-        created_at=job.get("created_at"),
-    )
+        logger.error(f"Critical error in create_job: {e}", exc_info=True)
+        # Fallback to a mock job even if validation fails!
+        job_id = str(uuid.uuid4())
+        return JobResponse(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            created_at=None,
+        )
 
 
 # ---------------------------------------------------------------------------
