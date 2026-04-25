@@ -14,8 +14,11 @@ google-generativeai==0.7.2
 # Image Processing (resize + JPEG encode only — no OpenCV/MediaPipe needed)
 Pillow==10.3.0
 
-# Supabase (for job status tracking)
-supabase==2.4.6
+# Supabase (Auth + DB + Storage)
+supabase==2.4.6      # bundles gotrue, storage3, postgrest
+
+# Email validation (required by Pydantic EmailStr in auth models)
+email-validator==2.1.1
 
 # Rate Limiting
 slowapi==0.1.9
