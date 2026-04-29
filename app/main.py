@@ -18,7 +18,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from app.config import get_settings
-from app.routers import auth, jobs, styles
+from app.routers import auth, billing, jobs, styles
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -86,9 +86,10 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
-app.include_router(auth.router, prefix="/api", tags=["Auth"])
-app.include_router(jobs.router, prefix="/api", tags=["Jobs"])
-app.include_router(styles.router, prefix="/api", tags=["Styles"])
+app.include_router(auth.router,    prefix="/api", tags=["Auth"])
+app.include_router(jobs.router,    prefix="/api", tags=["Jobs"])
+app.include_router(styles.router,  prefix="/api", tags=["Styles"])
+app.include_router(billing.router, prefix="/api", tags=["Billing"])
 
 
 # ---------------------------------------------------------------------------
