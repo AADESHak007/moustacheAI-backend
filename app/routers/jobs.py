@@ -30,6 +30,7 @@ from app.dependencies.auth import get_current_user
 from app.models.auth import UserProfile
 from app.models.job import JobResponse, JobStatus, JobStatusResponse
 from app.services.ai_pipeline import AIProcessingError, overlay_mustache
+from app.services.credits_service import CreditsService
 from app.services.image_service import ImageService
 from app.utils.validators import validate_image
 
@@ -59,7 +60,8 @@ async def _process_job(
     ai_image_id:    str,
 ) -> None:
     """Run the Gemini AI pipeline and persist the result to Supabase Storage."""
-    svc = ImageService()
+    svc     = ImageService()
+    credits = CreditsService()
 
     try:
         _jobs_db[job_id]["status"] = JobStatus.PROCESSING
@@ -87,12 +89,15 @@ async def _process_job(
         logger.warning(f"[AI] Job {job_id} failed: {exc}")
         _jobs_db[job_id].update({"status": JobStatus.FAILED, "error": str(exc)})
         await svc.mark_ai_failed(ai_image_id, str(exc))
+        # Credit was charged at job-creation time — give it back on failure.
+        credits.refund(user_id, amount=1)
 
     except Exception as exc:
         logger.error(f"[Job] Unexpected error for {job_id}: {exc}", exc_info=True)
         msg = "Internal AI error. Please try again."
         _jobs_db[job_id].update({"status": JobStatus.FAILED, "error": msg})
         await svc.mark_ai_failed(ai_image_id, msg)
+        credits.refund(user_id, amount=1)
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +129,17 @@ async def create_job(
     image_bytes = await validate_image(image)
     job_id = str(uuid.uuid4())
 
-    svc = ImageService()
+    svc     = ImageService()
+    credits = CreditsService()
+
+    # --- Credit gate -----------------------------------------------------
+    # 1 credit per generation. Charge up-front; refund on AI failure
+    # (see `_process_job`).
+    if not credits.try_spend(current_user.id, amount=1):
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="You're out of credits. Pick a plan to keep generating.",
+        )
 
     # --- Persist original image & create AI record -----------------------
     try:
@@ -136,6 +151,8 @@ async def create_job(
         )
     except Exception as exc:
         logger.error(f"[Jobs] Failed to persist image records: {exc}", exc_info=True)
+        # Storage failure isn't the user's fault — return the credit.
+        credits.refund(current_user.id, amount=1)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Could not save image. Please try again.",

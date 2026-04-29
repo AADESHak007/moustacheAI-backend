@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     # ---- Gemini AI ----
     gemini_api_key: str = ""
 
+    # ---- Razorpay (payments) ----
+    # Test creds: rzp_test_*  /  Live creds: rzp_live_*
+    razorpay_key_id:        str = ""
+    razorpay_key_secret:    str = ""
+    razorpay_webhook_secret: str = ""
+
+    # ---- Credits ----
+    free_signup_credits: int = 3
+
 
 @lru_cache()
 def get_settings() -> Settings:

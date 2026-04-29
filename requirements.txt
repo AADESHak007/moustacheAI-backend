@@ -23,6 +23,9 @@ email-validator==2.1.1
 # Rate Limiting
 slowapi==0.1.9
 
+# Payments — Razorpay (prepaid credit packs)
+razorpay==1.4.2
+
 # Config & Utilities
 pydantic-settings==2.2.1
 python-dotenv==1.0.1
